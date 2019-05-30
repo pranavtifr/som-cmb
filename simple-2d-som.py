@@ -7,12 +7,38 @@ import logging
 import sklearn.cluster as clus
 import somoclu
 
+
 def map_cleanup(mapps, in_mask=False):
+    """
+    Seperate the masked and unmaked region.
+
+    Parameters
+    ----------
+    Input Map: Numpy Array
+
+    Returns
+    -------
+    Cleaned Map, Masked Map, Unmasked Indices, Masked Indices : Numpy Array
+
+    Raises
+    ------
+    None
+
+    See Also
+    --------
+    None
+
+    Notes
+    -----
+    None
+
+    """
     if not in_mask:
         in_mask = np.ones(len(mapps))
     else:
         in_mask = hp.read_map("./mask.fits")
     cleaned_mapps = []
+    masked_mapps = []
     outlier_indices = []
     map_indices = []
     for ite in range(len(mapps)):
@@ -21,11 +47,37 @@ def map_cleanup(mapps, in_mask=False):
             cleaned_mapps.append(mapps[ite])
             map_indices.append(ite)
         else:
+            masked_mapps.append(mapps[ite])
             outlier_indices.append(ite)
-    return np.array(cleaned_mapps), outlier_indices, map_indices
+    return np.array(cleaned_mapps), np.array(masked_mapps), outlier_indices, map_indices
 
 
 def read_maps(res):
+    """
+    Read all the freqency maps and make it into a numpy array.
+
+    Parameters
+    ----------
+    resolution: Int
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    None
+
+    See Also
+    --------
+    None
+
+    Notes
+    -----
+    None
+
+    """
+
     if res == 45:
         lmax = 4000
     elif res == 60:
@@ -38,12 +90,36 @@ def read_maps(res):
     for y in range(1,13):
         filename = f"/{res}/HFI_SimMap_y{y}_2048_R1.10_nominal_rebeam{res}lmax{lmax}.fits"
         mapp = hp.read_map(source+filename, verbose=False)
-        print(f"For y = {y} : Min:{np.min(mapp)} Max:{np.max(mapp)}")
+        logging.info(f"For y = {y} : Min:{np.min(mapp)} Max:{np.max(mapp)}")
         maps.append(mapp)
     return np.array(maps).T
 
 
 def som(maps, kk=13):
+    """
+    SOM Using minisom library
+
+    Parameters
+    ----------
+    Maps: Numpy Array
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    None
+
+    See Also
+    --------
+    somoclu_cluster()
+    Notes
+    -----
+    Clusters using kmeans clustering after dimensionality reduction.
+    Writes the clusters to a fits file.
+    """
+
     dim = 50 # int(np.sqrt(len(maps)))
     som = minisom.MiniSom(dim, dim, 12, sigma=0.3, learning_rate=0.5) # initialization of 6x6 SOM
     som.train_random(maps, 100) # trains the SOM with 100 iterations
@@ -63,11 +139,36 @@ def som(maps, kk=13):
 
 
 def somoclu_cluster(maps, kk=13):
-    from sklearn import preprocessing
-    clean_map, masked, notmasked = map_cleanup(maps,True)
+    """
+    SOM Using somoclu library
 
+    Parameters
+    ----------
+    Maps: Numpy Array
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    None
+
+    See Also
+    --------
+    som()
+    Notes
+    -----
+    Clusters using kmeans clustering after dimensionality reduction.
+    Writes the clusters to a fits file.
+    """
+    logging.info(f"Preprocessing..")
+    from sklearn import preprocessing
+    clean_map, masked_map,masked, notmasked = map_cleanup(maps,True)
+    
     scaler = preprocessing.RobustScaler(quantile_range=(15., 85.))
     clean_map = scaler.fit_transform(clean_map)
+    masked_map = scaler.fit_transform(masked_map)
     n_rows, n_columns = 100, 100
     try:
         import _pickle as pkl
@@ -77,6 +178,7 @@ def somoclu_cluster(maps, kk=13):
         pass
 
 
+    logging.info(f"SOM on unmasked regions")
     som = somoclu.Somoclu(n_columns, n_rows,
                            compactsupport=True,
                            initialization="pca",
@@ -102,13 +204,41 @@ def somoclu_cluster(maps, kk=13):
         import _pickle as pkl
         pkl.dump(som.codebook, file2, -1)
 
+    logging.info(f"SOM on masked regions")
+    som1 = somoclu.Somoclu(n_columns, n_rows,
+                           compactsupport=True,
+                           initialization="pca",
+                           neighborhood="gaussian",
+                          #  initialcodebook=init_codebook,
+                           std_coeff=0.5, 
+                           verbose=2)
 
-    for i in range(10):
+    som1.train(masked_map, epochs=10, 
+              radius0=0, radiusN=1, 
+              radiuscooling='linear', scale0=0.1, 
+              scaleN=0.01, scalecooling='linear')
+
+    logging.info(f"Pickling BMUS and Codebooks")
+    logging.info(som1.bmus.shape)
+    logging.info(som1.codebook.shape)
+
+
+    with open('somoclu100_masked_bmus.pkl', 'wb') as file1:
+        import _pickle as pkl
+        pkl.dump(som1.bmus, file1, -1)
+
+    with open('somoclu100_masked_codebook.pkl', 'wb') as file2:
+        import _pickle as pkl
+        pkl.dump(som1.codebook, file2, -1)
+
+
+    for i in range(100):
+        finalmap = np.full(len(maps),hp.UNSEEN)
         logging.info(f"Clustering with Random Seed State {i}")
-        data_cluster = []
-        error = []
         clustermethod = clus.MiniBatchKMeans(n_clusters=kk, n_init = 10, random_state=i)
         som.cluster(algorithm=clustermethod)
+        data_cluster = []
+        error = []
         for k in range(len(som.bmus)):
             a,b = som.bmus[k]
             data_cluster.append(som.clusters[b][a])
@@ -116,11 +246,22 @@ def somoclu_cluster(maps, kk=13):
             error.append(temp)
         error = np.array(error)
         data_cluster = np.array(data_cluster)
-
-        finalmap = np.full(len(maps),hp.UNSEEN)
         finalmap[notmasked] = data_cluster
 
-        logging.info(f"Cluster Shape {data_cluster.shape}")
+        som1.cluster(algorithm=clustermethod)
+        data_cluster1 = []
+        error1 = []
+        for k in range(len(som.bmus)):
+            a,b = som.bmus[k]
+            data_cluster.append(som1.clusters[b][a])
+            temp = np.dot(som1.codebook[b][a],maps[k])
+            error.append(temp)
+        error = np.array(error)
+        data_cluster1 = np.array(data_cluster1) + 1
+        finalmap[masked] = -data_cluster1
+
+
+        logging.info(f"Cluster Shape {data_cluster.shape} and {data_cluster1.shape}")
         hp.write_map(f"somoclu-cluster_scaled_{i}.fits", finalmap, overwrite=True)
 
 
